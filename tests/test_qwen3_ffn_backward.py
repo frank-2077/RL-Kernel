@@ -41,16 +41,6 @@ requires_cuda_ffn = pytest.mark.skipif(
 )
 
 
-def _gloo_available():
-    return torch.distributed.is_available() and torch.distributed.is_gloo_available()
-
-
-requires_gloo = pytest.mark.skipif(
-    not _gloo_available(),
-    reason="parallel FFN CPU test requires torch.distributed Gloo",
-)
-
-
 class _TorchKernelStub:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -88,125 +78,73 @@ def _randn(shape, *, seed, device="cpu", dtype=torch.float32):
     return value.to(device=device, dtype=dtype)
 
 
-def _tp_ffn_backward_gloo_worker(rank, world_size, init_method, result_queue):
+def _distributed_ffn_backward_nccl_worker(
+    rank,
+    world_size,
+    init_method,
+    result_queue,
+    cp_size,
+    sequence_parallel,
+):
     try:
         import torch.distributed as dist
 
-        torch.set_num_threads(1)
+        torch.cuda.set_device(rank)
         dist.init_process_group(
-            backend="gloo",
+            backend="nccl",
             init_method=init_method,
             rank=rank,
             world_size=world_size,
         )
 
-        stub = _TorchKernelStub()
-        ffn_module._C = stub
-        ffn_module._EXT_AVAILABLE = True
-        ffn_module._validate_ffn_inputs = lambda *args: None
-
-        token_count, hidden_size, intermediate_size = 6, 5, 12
-        local_intermediate = intermediate_size // world_size
-        shard_start = rank * local_intermediate
-        shard_end = shard_start + local_intermediate
-
-        rmsnorm_output = _randn((token_count, hidden_size), seed=30)
-        gate_weight = _randn((intermediate_size, hidden_size), seed=31)
-        up_weight = _randn((intermediate_size, hidden_size), seed=32)
-        down_weight = _randn((hidden_size, intermediate_size), seed=33)
-        grad_output = _randn((token_count, hidden_size), seed=34)
-
-        reference_inputs = [
-            value.detach().clone().requires_grad_(True)
-            for value in (rmsnorm_output, gate_weight, up_weight, down_weight)
+        tp_size = world_size // cp_size
+        tp_groups = [
+            dist.new_group(list(range(cp_rank * tp_size, (cp_rank + 1) * tp_size)))
+            for cp_rank in range(cp_size)
         ]
-        reference_output, _, _, _ = _reference(*reference_inputs)
-        reference_output.backward(grad_output)
-
-        actual_inputs = [
-            value.detach().clone().requires_grad_(True)
-            for value in (
-                rmsnorm_output,
-                gate_weight[shard_start:shard_end].contiguous(),
-                up_weight[shard_start:shard_end].contiguous(),
-                down_weight[:, shard_start:shard_end].contiguous(),
-            )
+        cp_groups = [
+            dist.new_group([cp_rank * tp_size + tp_rank for cp_rank in range(cp_size)])
+            for tp_rank in range(tp_size)
         ]
-        actual_output = qwen3_ffn(
-            *actual_inputs,
-            tp_group=dist.group.WORLD,
-        )
-        actual_output.backward(grad_output)
-
-        expected_grads = (
-            reference_inputs[0].grad,
-            reference_inputs[1].grad[shard_start:shard_end],
-            reference_inputs[2].grad[shard_start:shard_end],
-            reference_inputs[3].grad[:, shard_start:shard_end],
-        )
-        result_queue.put(
-            {
-                "ok": True,
-                "rank": rank,
-                "max_errors": [float((actual_output - reference_output).abs().max().item())]
-                + [
-                    float((actual.grad - expected).abs().max().item())
-                    for actual, expected in zip(actual_inputs, expected_grads, strict=True)
-                ],
-            }
-        )
-    except Exception:  # pragma: no cover - forwarded to the parent process.
-        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
-        raise
-    finally:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-
-
-def _tp_cp_ffn_backward_gloo_worker(rank, world_size, init_method, result_queue):
-    try:
-        import torch.distributed as dist
-
-        torch.set_num_threads(1)
-        dist.init_process_group(
-            backend="gloo",
-            init_method=init_method,
-            rank=rank,
-            world_size=world_size,
-        )
-
-        tp_groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
-        cp_groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
-        tp_rank = rank % 2
-        cp_rank = rank // 2
+        tp_rank = rank % tp_size
+        cp_rank = rank // tp_size
         tp_group = tp_groups[cp_rank]
-        cp_group = cp_groups[tp_rank]
+        cp_group = cp_groups[tp_rank] if cp_size > 1 else None
 
-        stub = _TorchKernelStub()
-        ffn_module._C = stub
-        ffn_module._EXT_AVAILABLE = True
-        ffn_module._validate_ffn_inputs = lambda *args: None
-
-        token_count, hidden_size, intermediate_size = 8, 5, 12
-        local_tokens = token_count // 2
-        local_intermediate = intermediate_size // 2
-        token_start = cp_rank * local_tokens
+        token_count, hidden_size, intermediate_size = 8, 64, 128
+        cp_tokens = token_count // cp_size
+        local_tokens = cp_tokens // tp_size if sequence_parallel else cp_tokens
+        local_intermediate = intermediate_size // tp_size
+        token_start = cp_rank * cp_tokens
+        if sequence_parallel:
+            token_start += tp_rank * local_tokens
         token_end = token_start + local_tokens
         feature_start = tp_rank * local_intermediate
         feature_end = feature_start + local_intermediate
 
-        rmsnorm_output = _randn((token_count, hidden_size), seed=40)
-        gate_weight = _randn((intermediate_size, hidden_size), seed=41)
-        up_weight = _randn((intermediate_size, hidden_size), seed=42)
-        down_weight = _randn((hidden_size, intermediate_size), seed=43)
-        grad_output = _randn((token_count, hidden_size), seed=44)
+        device = torch.device("cuda", rank)
+        rmsnorm_output = _randn(
+            (token_count, hidden_size), seed=40, device=device, dtype=torch.bfloat16
+        )
+        gate_weight = _randn(
+            (intermediate_size, hidden_size), seed=41, device=device, dtype=torch.bfloat16
+        )
+        up_weight = _randn(
+            (intermediate_size, hidden_size), seed=42, device=device, dtype=torch.bfloat16
+        )
+        down_weight = _randn(
+            (hidden_size, intermediate_size), seed=43, device=device, dtype=torch.bfloat16
+        )
+        grad_output = _randn(
+            (token_count, hidden_size), seed=44, device=device, dtype=torch.bfloat16
+        )
 
         reference_inputs = [
-            value.detach().clone().requires_grad_(True)
+            value.detach().float().requires_grad_(True)
             for value in (rmsnorm_output, gate_weight, up_weight, down_weight)
         ]
         reference_output, _, _, _ = _reference(*reference_inputs)
-        reference_output.backward(grad_output)
+        reference_output.backward(grad_output.float())
 
         local_grad_output = grad_output[token_start:token_end].contiguous()
         actual_inputs = [
@@ -222,6 +160,7 @@ def _tp_cp_ffn_backward_gloo_worker(rank, world_size, init_method, result_queue)
             *actual_inputs,
             tp_group=tp_group,
             cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
         )
         actual_output.backward(local_grad_output)
 
@@ -231,19 +170,23 @@ def _tp_cp_ffn_backward_gloo_worker(rank, world_size, init_method, result_queue)
             reference_inputs[2].grad[feature_start:feature_end],
             reference_inputs[3].grad[:, feature_start:feature_end],
         )
+        torch.testing.assert_close(
+            actual_output.float(),
+            reference_output[token_start:token_end].detach(),
+            atol=5e-2,
+            rtol=2e-2,
+        )
+        for actual, expected in zip(actual_inputs, expected_grads, strict=True):
+            torch.testing.assert_close(
+                actual.grad.float(),
+                expected,
+                atol=5e-2,
+                rtol=2e-2,
+            )
         result_queue.put(
             {
                 "ok": True,
                 "rank": rank,
-                "max_errors": [
-                    float(
-                        (actual_output - reference_output[token_start:token_end]).abs().max().item()
-                    )
-                ]
-                + [
-                    float((actual.grad - expected).abs().max().item())
-                    for actual, expected in zip(actual_inputs, expected_grads, strict=True)
-                ],
             }
         )
     except Exception:  # pragma: no cover - forwarded to the parent process.
@@ -252,6 +195,66 @@ def _tp_cp_ffn_backward_gloo_worker(rank, world_size, init_method, result_queue)
     finally:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
+
+
+def _has_sm90_ffn_devices(count: int) -> bool:
+    return (
+        _EXT_AVAILABLE
+        and torch.distributed.is_available()
+        and torch.distributed.is_nccl_available()
+        and torch.cuda.device_count() >= count
+        and all(torch.cuda.get_device_capability(index)[0] == 9 for index in range(count))
+        and all(hasattr(_C, name) for name in _REQUIRED_SYMBOLS)
+    )
+
+
+def _run_distributed_ffn_test(*, world_size, cp_size, sequence_parallel):
+    if not _has_sm90_ffn_devices(world_size):
+        pytest.skip(
+            f"distributed FFN test requires {world_size} SM90 GPUs, NCCL, and extension symbols"
+        )
+
+    ctx = mp.get_context("spawn")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_method = (Path(tmpdir) / "nccl_init").as_uri()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_distributed_ffn_backward_nccl_worker,
+                args=(
+                    rank,
+                    world_size,
+                    init_method,
+                    result_queue,
+                    cp_size,
+                    sequence_parallel,
+                ),
+            )
+            for rank in range(world_size)
+        ]
+
+        for process in processes:
+            process.start()
+
+        results = []
+        try:
+            for _ in processes:
+                results.append(result_queue.get(timeout=90))
+        except queue.Empty:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+            pytest.fail("timed out waiting for distributed NCCL FFN workers")
+        finally:
+            for process in processes:
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+
+    for result in sorted(results, key=lambda item: item["rank"]):
+        assert result["ok"], result.get("traceback")
+    for process in processes:
+        assert process.exitcode == 0
 
 
 def test_qwen3_8b_dimensions_are_pinned():
@@ -295,84 +298,22 @@ def test_backward_matches_autograd_reference(monkeypatch):
     assert stub.calls.count("swiglu_backward") == 1
 
 
-@requires_gloo
-def test_tensor_parallel_backward_matches_full_reference_cpu_gloo_2_ranks():
-    ctx = mp.get_context("spawn")
-    world_size = 2
-    with tempfile.TemporaryDirectory() as tmpdir:
-        init_method = (Path(tmpdir) / "gloo_init").as_uri()
-        result_queue = ctx.Queue()
-        processes = [
-            ctx.Process(
-                target=_tp_ffn_backward_gloo_worker,
-                args=(rank, world_size, init_method, result_queue),
-            )
-            for rank in range(world_size)
-        ]
-
-        for process in processes:
-            process.start()
-
-        results = []
-        try:
-            for _ in processes:
-                results.append(result_queue.get(timeout=45))
-        except queue.Empty:
-            for process in processes:
-                if process.is_alive():
-                    process.terminate()
-            pytest.fail("timed out waiting for tensor-parallel Gloo workers")
-        finally:
-            for process in processes:
-                process.join(timeout=10)
-                if process.is_alive():
-                    process.terminate()
-
-    for result in sorted(results, key=lambda item: item["rank"]):
-        assert result["ok"], result.get("traceback")
-        assert max(result["max_errors"]) < 1e-6
-    for process in processes:
-        assert process.exitcode == 0
+@pytest.mark.parametrize("sequence_parallel", [False, True], ids=["tp", "tp_sp"])
+def test_tensor_parallel_backward_matches_reference_nccl(sequence_parallel):
+    _run_distributed_ffn_test(
+        world_size=2,
+        cp_size=1,
+        sequence_parallel=sequence_parallel,
+    )
 
 
-@requires_gloo
-def test_tensor_context_parallel_backward_matches_reference_cpu_gloo_4_ranks():
-    ctx = mp.get_context("spawn")
-    world_size = 4
-    with tempfile.TemporaryDirectory() as tmpdir:
-        init_method = (Path(tmpdir) / "gloo_init").as_uri()
-        result_queue = ctx.Queue()
-        processes = [
-            ctx.Process(
-                target=_tp_cp_ffn_backward_gloo_worker,
-                args=(rank, world_size, init_method, result_queue),
-            )
-            for rank in range(world_size)
-        ]
-
-        for process in processes:
-            process.start()
-
-        results = []
-        try:
-            for _ in processes:
-                results.append(result_queue.get(timeout=45))
-        except queue.Empty:
-            for process in processes:
-                if process.is_alive():
-                    process.terminate()
-            pytest.fail("timed out waiting for TP+CP Gloo workers")
-        finally:
-            for process in processes:
-                process.join(timeout=10)
-                if process.is_alive():
-                    process.terminate()
-
-    for result in sorted(results, key=lambda item: item["rank"]):
-        assert result["ok"], result.get("traceback")
-        assert max(result["max_errors"]) < 1e-6
-    for process in processes:
-        assert process.exitcode == 0
+@pytest.mark.parametrize("sequence_parallel", [False, True], ids=["tp_cp", "tp_cp_sp"])
+def test_tensor_context_parallel_backward_matches_reference_nccl(sequence_parallel):
+    _run_distributed_ffn_test(
+        world_size=4,
+        cp_size=2,
+        sequence_parallel=sequence_parallel,
+    )
 
 
 def test_rejects_non_huggingface_weight_layout():

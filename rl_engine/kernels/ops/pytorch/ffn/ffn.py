@@ -99,6 +99,45 @@ def _validate_ffn_inputs(
             )
 
 
+def _all_gather_tokens(tensor: Tensor, dist, group: Any) -> Tensor:
+    world_size = dist.get_world_size(group=group)
+    output = torch.empty(
+        (world_size * tensor.size(0), *tensor.shape[1:]),
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    # TODO: NCCL AllGather can expose cross-configuration mismatch. Replace it
+    # with the custom deterministic AllGather and compare both paths.
+    dist.all_gather_into_tensor(output, tensor.contiguous(), group=group)
+    return output
+
+
+def _reduce_scatter_tokens(tensor: Tensor, dist, group: Any) -> Tensor:
+    world_size = dist.get_world_size(group=group)
+    if tensor.size(0) % world_size != 0:
+        raise ValueError(
+            "the gathered token count must be divisible by the tensor-parallel "
+            f"world size, got {tensor.size(0)} and {world_size}."
+        )
+
+    local_tokens = tensor.size(0) // world_size
+    output = torch.empty(
+        (local_tokens, *tensor.shape[1:]),
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    # TODO: NCCL ReduceScatter can change the reduction order and cause
+    # mismatch. Replace it with the custom deterministic ReduceScatter and
+    # compare both paths.
+    dist.reduce_scatter_tensor(
+        output,
+        tensor.contiguous(),
+        op=dist.ReduceOp.SUM,
+        group=group,
+    )
+    return output
+
+
 class _DeterministicFFNFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -109,12 +148,19 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         down_weight: Tensor,
         tp_group: Any,
         cp_group: Any,
+        sequence_parallel: bool,
     ) -> Tensor:
         tp_dist = _require_parallel_group(tp_group, "tensor")
         _require_parallel_group(cp_group, "context")
+        if sequence_parallel and tp_dist is None:
+            raise ValueError("sequence_parallel requires a tensor-parallel group.")
+        if sequence_parallel and str(tp_dist.get_backend(tp_group)) != "nccl":
+            raise RuntimeError("sequence-parallel FFN currently requires an NCCL process group.")
 
         input_shape = rmsnorm_output.shape
         rmsnorm_output_2d = rmsnorm_output.reshape(-1, input_shape[-1]).contiguous()
+        if sequence_parallel:
+            rmsnorm_output_2d = _all_gather_tokens(rmsnorm_output_2d, tp_dist, tp_group)
 
         # The model stores projection weights as [out, in]; GEMM consumes [K, N].
         gate = _C.det_gemm_fwd(rmsnorm_output_2d, gate_weight.t().contiguous())
@@ -122,7 +168,9 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         activated = _C.swiglu_forward(gate, up)
         output = _C.det_gemm_fwd(activated, down_weight.t().contiguous())
 
-        if tp_dist is not None:
+        if sequence_parallel:
+            output = _reduce_scatter_tokens(output, tp_dist, tp_group)
+        elif tp_dist is not None:
             # TODO: CUDA currently uses NCCL. Replace it with the custom
             # deterministic AllReduce and compare both communication paths.
             tp_dist.all_reduce(output, op=tp_dist.ReduceOp.SUM, group=tp_group)
@@ -139,6 +187,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         ctx.input_shape = input_shape
         ctx.tp_group = tp_group
         ctx.cp_group = cp_group
+        ctx.sequence_parallel = sequence_parallel
         return output.reshape(*input_shape[:-1], output.size(-1))
 
     @staticmethod
@@ -155,6 +204,8 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         tp_dist = _require_parallel_group(ctx.tp_group, "tensor")
         cp_dist = _require_parallel_group(ctx.cp_group, "context")
         grad_output = grad_output.reshape(-1, grad_output.size(-1)).contiguous()
+        if ctx.sequence_parallel:
+            grad_output = _all_gather_tokens(grad_output, tp_dist, ctx.tp_group)
 
         # Down weight gradients use the same coordinates across CP ranks.
         grad_down_weight = _C.det_gemm_db(activated, grad_output).t().contiguous()
@@ -190,7 +241,13 @@ class _DeterministicFFNFunction(torch.autograd.Function):
 
         # Gate/Up input gradients reduce across TP, then add locally.
         grad_rmsnorm_from_gate = _C.det_gemm_fwd(grad_gate, gate_weight)
-        if tp_dist is not None:
+        if ctx.sequence_parallel:
+            grad_rmsnorm_from_gate = _reduce_scatter_tokens(
+                grad_rmsnorm_from_gate,
+                tp_dist,
+                ctx.tp_group,
+            )
+        elif tp_dist is not None:
             # TODO: CUDA currently uses NCCL. Replace it with the custom
             # deterministic AllReduce and compare both communication paths.
             tp_dist.all_reduce(
@@ -200,7 +257,13 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             )
 
         grad_rmsnorm_from_up = _C.det_gemm_fwd(grad_up, up_weight)
-        if tp_dist is not None:
+        if ctx.sequence_parallel:
+            grad_rmsnorm_from_up = _reduce_scatter_tokens(
+                grad_rmsnorm_from_up,
+                tp_dist,
+                ctx.tp_group,
+            )
+        elif tp_dist is not None:
             tp_dist.all_reduce(
                 grad_rmsnorm_from_up,
                 op=tp_dist.ReduceOp.SUM,
@@ -215,6 +278,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             grad_down_weight,
             None,
             None,
+            None,
         )
 
 
@@ -226,6 +290,7 @@ def qwen3_ffn(
     *,
     tp_group: Any = None,
     cp_group: Any = None,
+    sequence_parallel: bool = False,
 ) -> Tensor:
     """Apply a bias-free SiLU-gated FFN with deterministic backward kernels.
 
@@ -241,12 +306,16 @@ def qwen3_ffn(
             column-parallel; Down is row-parallel.
         cp_group: Optional context-parallel process group. Each rank owns
             different token rows and the same local weight shards.
+        sequence_parallel: Whether ``rmsnorm_output`` and the returned output
+            are sharded on the flattened token dimension across ``tp_group``.
 
     Returns:
         FFN output with shape ``[..., H]``.
     """
     _validate_ffn_inputs(rmsnorm_output, gate_weight, up_weight, down_weight)
     _require_ffn_kernels()
+    if not isinstance(sequence_parallel, bool):
+        raise TypeError("sequence_parallel must be a bool.")
     return _DeterministicFFNFunction.apply(
         rmsnorm_output,
         gate_weight,
@@ -254,4 +323,5 @@ def qwen3_ffn(
         down_weight,
         tp_group,
         cp_group,
+        sequence_parallel,
     )
