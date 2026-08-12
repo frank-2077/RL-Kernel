@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Bias-free gated FFN backward assembled from deterministic CUDA kernels."""
+"""Bias-free gated FFN assembled from deterministic CUDA kernels."""
 
 from __future__ import annotations
 
@@ -17,51 +17,44 @@ QWEN3_8B_INTERMEDIATE_SIZE = 12288
 _REQUIRED_SYMBOLS = (
     "det_gemm_fwd",
     "det_gemm_db",
+    "swiglu_forward",
     "swiglu_backward",
 )
 
 
-def _require_ffn_backward_kernels() -> None:
+def _require_ffn_kernels() -> None:
     missing = [name for name in _REQUIRED_SYMBOLS if not hasattr(_C, name)]
     if not _EXT_AVAILABLE or _C is None or missing:
         suffix = f" Missing symbols: {', '.join(missing)}." if missing else ""
         raise RuntimeError(
-            "qwen3_ffn_backward requires the compiled deterministic GEMM and "
+            "qwen3_ffn requires the compiled deterministic GEMM and "
             f"SwiGLU CUDA kernels.{suffix}"
         )
 
 
-def _require_tensor_parallel_group(tp_group: Any):
-    if tp_group is None:
+def _require_parallel_group(group: Any, name: str):
+    if group is None:
         return None
 
     import torch.distributed as dist
 
     if not dist.is_available():
-        raise RuntimeError("tensor-parallel FFN backward requires torch.distributed.")
+        raise RuntimeError(f"{name}-parallel FFN requires torch.distributed.")
     if not dist.is_initialized():
-        raise RuntimeError("tensor-parallel FFN backward requires an initialized process group.")
-    if dist.get_world_size(group=tp_group) <= 1:
-        raise ValueError("tp_group must contain at least two ranks.")
+        raise RuntimeError(f"{name}-parallel FFN requires an initialized process group.")
+    if dist.get_world_size(group=group) <= 1:
+        raise ValueError(f"{name}_group must contain at least two ranks.")
     return dist
 
 
-def _validate_ffn_backward_inputs(
-    grad_output: Tensor,
+def _validate_ffn_inputs(
     rmsnorm_output: Tensor,
-    gate: Tensor,
-    up: Tensor,
-    activated: Tensor,
     gate_weight: Tensor,
     up_weight: Tensor,
     down_weight: Tensor,
 ) -> None:
     tensors = {
-        "grad_output": grad_output,
         "rmsnorm_output": rmsnorm_output,
-        "gate": gate,
-        "up": up,
-        "activated": activated,
         "gate_weight": gate_weight,
         "up_weight": up_weight,
         "down_weight": down_weight,
@@ -83,12 +76,8 @@ def _validate_ffn_backward_inputs(
             raise ValueError(f"{name} must be 2-D, got shape {tuple(weight.shape)}.")
 
     hidden_size = rmsnorm_output.size(-1)
-    intermediate_size = gate.size(-1)
+    intermediate_size = gate_weight.size(0)
     expected_shapes = {
-        "grad_output": (*rmsnorm_output.shape[:-1], hidden_size),
-        "gate": (*rmsnorm_output.shape[:-1], intermediate_size),
-        "up": (*rmsnorm_output.shape[:-1], intermediate_size),
-        "activated": (*rmsnorm_output.shape[:-1], intermediate_size),
         "gate_weight": (intermediate_size, hidden_size),
         "up_weight": (intermediate_size, hidden_size),
         "down_weight": (hidden_size, intermediate_size),
@@ -110,119 +99,159 @@ def _validate_ffn_backward_inputs(
             )
 
 
-def qwen3_ffn_backward(
-    grad_output: Tensor,
+class _DeterministicFFNFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        rmsnorm_output: Tensor,
+        gate_weight: Tensor,
+        up_weight: Tensor,
+        down_weight: Tensor,
+        tp_group: Any,
+        cp_group: Any,
+    ) -> Tensor:
+        tp_dist = _require_parallel_group(tp_group, "tensor")
+        _require_parallel_group(cp_group, "context")
+
+        input_shape = rmsnorm_output.shape
+        rmsnorm_output_2d = rmsnorm_output.reshape(-1, input_shape[-1]).contiguous()
+
+        # The model stores projection weights as [out, in]; GEMM consumes [K, N].
+        gate = _C.det_gemm_fwd(rmsnorm_output_2d, gate_weight.t().contiguous())
+        up = _C.det_gemm_fwd(rmsnorm_output_2d, up_weight.t().contiguous())
+        activated = _C.swiglu_forward(gate, up)
+        output = _C.det_gemm_fwd(activated, down_weight.t().contiguous())
+
+        if tp_dist is not None:
+            # TODO: CUDA currently uses NCCL. Replace it with the custom
+            # deterministic AllReduce and compare both communication paths.
+            tp_dist.all_reduce(output, op=tp_dist.ReduceOp.SUM, group=tp_group)
+
+        ctx.save_for_backward(
+            rmsnorm_output_2d,
+            gate,
+            up,
+            activated,
+            gate_weight,
+            up_weight,
+            down_weight,
+        )
+        ctx.input_shape = input_shape
+        ctx.tp_group = tp_group
+        ctx.cp_group = cp_group
+        return output.reshape(*input_shape[:-1], output.size(-1))
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        (
+            rmsnorm_output,
+            gate,
+            up,
+            activated,
+            gate_weight,
+            up_weight,
+            down_weight,
+        ) = ctx.saved_tensors
+        tp_dist = _require_parallel_group(ctx.tp_group, "tensor")
+        cp_dist = _require_parallel_group(ctx.cp_group, "context")
+        grad_output = grad_output.reshape(-1, grad_output.size(-1)).contiguous()
+
+        # Down weight gradients use the same coordinates across CP ranks.
+        grad_down_weight = _C.det_gemm_db(activated, grad_output).t().contiguous()
+        if cp_dist is not None:
+            # TODO: CUDA currently uses NCCL. Replace it with the custom
+            # deterministic AllReduce and compare both communication paths.
+            cp_dist.all_reduce(
+                grad_down_weight,
+                op=cp_dist.ReduceOp.SUM,
+                group=ctx.cp_group,
+            )
+
+        # Down input-gradient shards concatenate across TP; no TP reduction.
+        grad_activated = _C.det_gemm_fwd(grad_output, down_weight)
+        grad_gate, grad_up = _C.swiglu_backward(grad_activated, gate, up)
+
+        # Gate/Up weight-gradient shards concatenate across TP and reduce across CP.
+        grad_gate_weight = _C.det_gemm_db(rmsnorm_output, grad_gate).t().contiguous()
+        if cp_dist is not None:
+            cp_dist.all_reduce(
+                grad_gate_weight,
+                op=cp_dist.ReduceOp.SUM,
+                group=ctx.cp_group,
+            )
+
+        grad_up_weight = _C.det_gemm_db(rmsnorm_output, grad_up).t().contiguous()
+        if cp_dist is not None:
+            cp_dist.all_reduce(
+                grad_up_weight,
+                op=cp_dist.ReduceOp.SUM,
+                group=ctx.cp_group,
+            )
+
+        # Gate/Up input gradients reduce across TP, then add locally.
+        grad_rmsnorm_from_gate = _C.det_gemm_fwd(grad_gate, gate_weight)
+        if tp_dist is not None:
+            # TODO: CUDA currently uses NCCL. Replace it with the custom
+            # deterministic AllReduce and compare both communication paths.
+            tp_dist.all_reduce(
+                grad_rmsnorm_from_gate,
+                op=tp_dist.ReduceOp.SUM,
+                group=ctx.tp_group,
+            )
+
+        grad_rmsnorm_from_up = _C.det_gemm_fwd(grad_up, up_weight)
+        if tp_dist is not None:
+            tp_dist.all_reduce(
+                grad_rmsnorm_from_up,
+                op=tp_dist.ReduceOp.SUM,
+                group=ctx.tp_group,
+            )
+
+        grad_rmsnorm_output = grad_rmsnorm_from_gate.add_(grad_rmsnorm_from_up)
+        return (
+            grad_rmsnorm_output.reshape(ctx.input_shape),
+            grad_gate_weight,
+            grad_up_weight,
+            grad_down_weight,
+            None,
+            None,
+        )
+
+
+def qwen3_ffn(
     rmsnorm_output: Tensor,
-    gate: Tensor,
-    up: Tensor,
-    activated: Tensor,
     gate_weight: Tensor,
     up_weight: Tensor,
     down_weight: Tensor,
     *,
     tp_group: Any = None,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Compute all gradients of a bias-free SiLU-gated FFN.
-
-    ``T`` denotes the product of all leading token dimensions, ``H`` the hidden
-    width, and ``I`` the intermediate width. The corresponding forward is::
-
-        gate = rmsnorm_output @ gate_weight.T
-        up = rmsnorm_output @ up_weight.T
-        activated = silu(gate) * up
-        output = activated @ down_weight.T
+    cp_group: Any = None,
+) -> Tensor:
+    """Apply a bias-free SiLU-gated FFN with deterministic backward kernels.
 
     Args:
-        grad_output: Gradient from the FFN output, shape ``[..., H]``.
-        rmsnorm_output: Saved RMSNorm output consumed by both input projections,
-            shape ``[..., H]``. It is the tensor whose gradient must be returned
-            to the RMSNorm backward.
-        gate: Saved gate projection output before SiLU, shape ``[..., I]``.
-        up: Saved up projection output, shape ``[..., I]``.
-        activated: Saved SwiGLU result ``silu(gate) * up``, shape ``[..., I]``.
+        rmsnorm_output: RMSNorm output, shape ``[..., H]``.
         gate_weight: Gate projection weight in ``[out, in]`` layout, shape
-            ``[I, H]``.
+            ``[I_local, H]``.
         up_weight: Up projection weight in ``[out, in]`` layout, shape
-            ``[I, H]``.
+            ``[I_local, H]``.
         down_weight: Down projection weight in ``[out, in]`` layout, shape
-            ``[H, I]``.
-        tp_group: Optional tensor-parallel process group. ``None`` selects the
-            single-rank path.
-
-    TP gradient layout (``I_local = I / TP``):
-        - Gate/Up are column-parallel. Their input gradients have the same
-          ``[T,H]`` coordinates and are reduced across TP. Their weight
-          gradients are shards that concatenate on dimension 0 to ``[I,H]``.
-        - Down is row-parallel. Its input-gradient shards concatenate on the
-          last dimension to ``[T,I]``. Its weight-gradient shards concatenate
-          on dimension 1 to ``[H,I]``.
-
-        This function performs the Gate and Up input-gradient reductions
-        separately, then adds the two complete ``[T,H]`` gradients locally.
-        Concatenation describes shard ownership and does not require a
-        collective inside this function.
+            ``[H, I_local]``.
+        tp_group: Optional tensor-parallel process group. Gate and Up are
+            column-parallel; Down is row-parallel.
+        cp_group: Optional context-parallel process group. Each rank owns
+            different token rows and the same local weight shards.
 
     Returns:
-        ``(grad_rmsnorm_output, grad_gate_weight, grad_up_weight,
-        grad_down_weight)``. Each gradient has the same shape and layout as its
-        corresponding forward input.
+        FFN output with shape ``[..., H]``.
     """
-
-    _validate_ffn_backward_inputs(
-        grad_output,
+    _validate_ffn_inputs(rmsnorm_output, gate_weight, up_weight, down_weight)
+    _require_ffn_kernels()
+    return _DeterministicFFNFunction.apply(
         rmsnorm_output,
-        gate,
-        up,
-        activated,
         gate_weight,
         up_weight,
         down_weight,
-    )
-    _require_ffn_backward_kernels()
-    dist = _require_tensor_parallel_group(tp_group)
-
-    # GEMM kernels accept 2-D matrices. Flatten all leading token dimensions
-    # into T while preserving H or I as the reduction/projection dimension.
-    rmsnorm_output_2d = rmsnorm_output.reshape(-1, rmsnorm_output.size(-1)).contiguous()
-    grad_output_2d = grad_output.reshape(-1, grad_output.size(-1)).contiguous()
-    gate_2d = gate.reshape(-1, gate.size(-1)).contiguous()
-    up_2d = up.reshape(-1, up.size(-1)).contiguous()
-    activated_2d = activated.reshape(-1, activated.size(-1)).contiguous()
-
-    # Down is row-parallel. Each rank returns grad_down_weight[H,I_local]; the
-    # full weight gradient is concat(local_grad, dim=1).
-    grad_down_weight = _C.det_gemm_db(activated_2d, grad_output_2d).t().contiguous()
-
-    # Each rank returns grad_activated[T,I_local]; the full input gradient of
-    # Down is concat(local_grad, dim=-1), so no TP reduction is needed here.
-    grad_activated = _C.det_gemm_fwd(grad_output_2d, down_weight)
-
-    # Differentiate activated = silu(gate) * up elementwise.
-    grad_gate, grad_up = _C.swiglu_backward(grad_activated, gate_2d, up_2d)
-
-    # Gate/Up are column-parallel. Each local weight gradient is [I_local,H];
-    # the full weight gradient is concat(local_grad, dim=0).
-    grad_gate_weight = _C.det_gemm_db(rmsnorm_output_2d, grad_gate).t().contiguous()
-    grad_up_weight = _C.det_gemm_db(rmsnorm_output_2d, grad_up).t().contiguous()
-
-    # Gate/Up local input gradients address the same [T,H] coordinates. Keep
-    # their ColumnParallel backward boundaries separate: reduce each complete
-    # branch across TP, then add the two results locally.
-    grad_rmsnorm_from_gate = _C.det_gemm_fwd(grad_gate, gate_weight)
-    if dist is not None:
-        # TODO: CUDA currently uses NCCL. Replace it with the custom
-        # deterministic AllReduce and compare both communication paths.
-        dist.all_reduce(grad_rmsnorm_from_gate, op=dist.ReduceOp.SUM, group=tp_group)
-
-    grad_rmsnorm_from_up = _C.det_gemm_fwd(grad_up, up_weight)
-    if dist is not None:
-        dist.all_reduce(grad_rmsnorm_from_up, op=dist.ReduceOp.SUM, group=tp_group)
-
-    grad_rmsnorm_output = grad_rmsnorm_from_gate.add_(grad_rmsnorm_from_up)
-
-    return (
-        grad_rmsnorm_output.reshape_as(rmsnorm_output),
-        grad_gate_weight,
-        grad_up_weight,
-        grad_down_weight,
+        tp_group,
+        cp_group,
     )
