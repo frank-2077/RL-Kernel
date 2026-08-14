@@ -183,6 +183,35 @@ def _distributed_ffn_backward_nccl_worker(
                 atol=5e-2,
                 rtol=2e-2,
             )
+
+        slice_size = max(1, local_tokens // 2)
+        slice_start = (local_tokens - slice_size) // 2
+        slice_end = slice_start + slice_size
+        slice_inputs = [
+            value.detach().clone().requires_grad_(True)
+            for value in (
+                actual_inputs[0][slice_start:slice_end].contiguous(),
+                actual_inputs[1],
+                actual_inputs[2],
+                actual_inputs[3],
+            )
+        ]
+        slice_output = qwen3_ffn(
+            *slice_inputs,
+            tp_group=tp_group,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+        )
+        slice_output.backward(local_grad_output[slice_start:slice_end])
+
+        assert torch.equal(
+            slice_output,
+            actual_output[slice_start:slice_end],
+        ), "FFN output changed with the local token batch size"
+        assert torch.equal(
+            slice_inputs[0].grad,
+            actual_inputs[0].grad[slice_start:slice_end],
+        ), "FFN input gradient changed with the local token batch size"
         result_queue.put(
             {
                 "ok": True,
@@ -298,21 +327,35 @@ def test_backward_matches_autograd_reference(monkeypatch):
     assert stub.calls.count("swiglu_backward") == 1
 
 
-@pytest.mark.parametrize("sequence_parallel", [False, True], ids=["tp", "tp_sp"])
-def test_tensor_parallel_backward_matches_reference_nccl(sequence_parallel):
+def test_tp_ffn_correctness_and_batch_invariance_nccl():
     _run_distributed_ffn_test(
         world_size=2,
         cp_size=1,
-        sequence_parallel=sequence_parallel,
+        sequence_parallel=False,
     )
 
 
-@pytest.mark.parametrize("sequence_parallel", [False, True], ids=["tp_cp", "tp_cp_sp"])
-def test_tensor_context_parallel_backward_matches_reference_nccl(sequence_parallel):
+def test_tp_sp_ffn_correctness_and_batch_invariance_nccl():
+    _run_distributed_ffn_test(
+        world_size=2,
+        cp_size=1,
+        sequence_parallel=True,
+    )
+
+
+def test_tp_cp_ffn_correctness_and_batch_invariance_nccl():
     _run_distributed_ffn_test(
         world_size=4,
         cp_size=2,
-        sequence_parallel=sequence_parallel,
+        sequence_parallel=False,
+    )
+
+
+def test_tp_cp_sp_ffn_correctness_and_batch_invariance_nccl():
+    _run_distributed_ffn_test(
+        world_size=4,
+        cp_size=2,
+        sequence_parallel=True,
     )
 
 
